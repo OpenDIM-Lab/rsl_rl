@@ -60,7 +60,8 @@ class EmpiricalNormalization(nn.Module):
         delta_mean = mean_x - self._mean
         self._mean += rate * delta_mean
         self._var += rate * (var_x - self._var + delta_mean * (mean_x - self._mean))
-        self._std = torch.sqrt(self._var)
+        # Keep the registered buffer non-inference so checkpoint reload remains writable.
+        torch.sqrt(self._var, out=self._std)
 
     @torch.jit.unused
     def inverse(self, y: torch.Tensor) -> torch.Tensor:

@@ -28,6 +28,7 @@ class Distillation:
         loss_type: str = "mse",
         optimizer: str = "adam",
         device: str = "cpu",
+        replay_buffer_size: int = 0,
         # Distributed training parameters
         multi_gpu_cfg: dict | None = None,
     ) -> None:
@@ -60,6 +61,14 @@ class Distillation:
         self.gradient_length = gradient_length
         self.learning_rate = learning_rate
         self.max_grad_norm = max_grad_norm
+        # Replay buffer for distillation: number of most recent iterations whose
+        # (observation, teacher action) batches are kept for training. With 0 the
+        # algorithm behaves exactly like plain online DAgger (train on the current
+        # rollout only). Since the labels are teacher actions (independent of the
+        # student policy), old samples remain valid, and reusing them greatly
+        # improves sample efficiency when the environment count is small.
+        self.replay_buffer_size = replay_buffer_size
+        self.replay_steps: list[tuple[TensorDict, torch.Tensor]] = []
 
         # Initialize the loss function
         loss_fn_dict = {
@@ -119,10 +128,31 @@ class Distillation:
         loss = 0
         cnt = 0
 
+        # Append the current rollout to the replay buffer (detached copies, one
+        # entry per environment step). The teacher actions are the labels.
+        n_steps = self.storage.num_transitions_per_env
+        if self.replay_buffer_size > 0:
+            for i in range(n_steps):
+                self.replay_steps.append(
+                    (self.storage.observations[i].clone(), self.storage.privileged_actions[i].clone())
+                )
+            max_steps = self.replay_buffer_size * n_steps
+            while len(self.replay_steps) > max_steps:
+                self.replay_steps.pop(0)
+            train_steps = self.replay_steps
+        else:
+            train_steps = [
+                (self.storage.observations[i], self.storage.privileged_actions[i]) for i in range(n_steps)
+            ]
+
         for epoch in range(self.num_learning_epochs):
             self.policy.reset(hidden_states=self.last_hidden_states)
             self.policy.detach_hidden_states()
-            for obs, _, privileged_actions, dones in self.storage.generator():
+            # shuffle the step batches every epoch (online DAgger without buffer
+            # also benefits: it breaks the temporal correlation of the rollout)
+            order = torch.randperm(len(train_steps), device="cpu")
+            for idx in order.tolist():
+                obs, privileged_actions = train_steps[idx]
                 # Inference of the student for gradient computation
                 actions = self.policy.act_inference(obs)
 
@@ -145,10 +175,6 @@ class Distillation:
                     self.optimizer.step()
                     self.policy.detach_hidden_states()
                     loss = 0
-
-                # Reset dones
-                self.policy.reset(dones.view(-1))
-                self.policy.detach_hidden_states(dones.view(-1))
 
         mean_behavior_loss /= cnt
         self.storage.clear()
